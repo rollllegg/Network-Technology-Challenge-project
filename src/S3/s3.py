@@ -3,276 +3,354 @@ import numpy as np
 from scipy.spatial import cKDTree
 import json
 import math
-import networkx as nx  
+import networkx as nx
+import glob
+import os
 
-class NumpyEncoder(json.JSONEncoder):
-    """ Special json encoder for numpy types """
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return super(NumpyEncoder, self).default(obj)
-
-# 常量配置
-MAX_LINK_RANGE = 5000 * 1000 
+# --- 全局配置 ---
+MAX_LINK_RANGE = 5000 * 1000  # 5000km
 MIN_ELEVATION_DEG = 10.0      
 SPEED_OF_LIGHT = 3e8          
 
+# 模拟业务配置 (根据真实节点ID修改)
+# 假设 UAV_01 有地图，某个卫星有视频
+# 注意：这里的 Key 必须和 CSV 里的 node_id 一致
 CONTENT_LOCATIONS = {
-    "UAV_05": ["map.tif"], # 指定这架无人机有缓存
-    "SAT_25": ["video.ts"] # 指定这颗卫星有视频
+    "UAV_01": ["map.tif"],       
+    "SAT_63188": ["video.ts"]
 }
 
-# 简单的哈希映射：把 ID 映射成 IP
-# 例如 GS_01 -> 10.0.1.1
-def get_ip_by_id(node_id):
-    try:
-        prefix, num = node_id.split('_')
-        n = int(num)
-        if prefix == 'GS': return f"10.0.1.{n+1}"
-        if prefix == 'UAV': return f"10.0.2.{n+1}"
-        if prefix == 'SAT': return f"10.0.3.{n+1}"
-    except:
-        return "127.0.0.1"
-    return "127.0.0.1"
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer): return int(obj)
+        elif isinstance(obj, np.floating): return float(obj)
+        elif isinstance(obj, np.ndarray): return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
 
-# 1: 辅助函数
-def calculate_delay(dist_m):
-    return (dist_m / SPEED_OF_LIGHT) * 1000
+# ---------------------------------------------------------
+# 模块 0: 数据加载与融合 (Data Fusion)
+# ---------------------------------------------------------
+def load_and_merge_traces(sat_dir='sat_trace', uav_dir='uav_trace'):
+    print(">>> Loading Trace Data...")
+    
+    # 1. 读取所有卫星数据
+    sat_files = glob.glob(os.path.join(sat_dir, "*.csv"))
+    sat_dfs = []
+    for f in sat_files:
+        print(f"  - Reading {f}")
+        df = pd.read_csv(f)
+        # 统一列名: 只要 id, type, x, y, z, ip, time
+        # 卫星 CSV: node_id, type, ecef_x, ecef_y, ecef_z, ip, time_ms
+        sat_dfs.append(df)
+    
+    df_sat = pd.concat(sat_dfs) if sat_dfs else pd.DataFrame()
+    
+    # 2. 读取所有 UAV/地面站数据
+    uav_files = glob.glob(os.path.join(uav_dir, "*.csv"))
+    uav_dfs = []
+    for f in uav_files:
+        print(f"  - Reading {f}")
+        df = pd.read_csv(f)
+        # UAV CSV: node_id, type, ecef_x, ecef_y, ecef_z, ip, time_ms
+        uav_dfs.append(df)
+        
+    df_uav = pd.concat(uav_dfs) if uav_dfs else pd.DataFrame()
 
-def calculate_jitter(delay_ms):
-    return delay_ms * 0.1
+    # 3. 关键：时间对齐
+    # 卫星数据是 1000ms 一次，UAV 是 100ms 一次
+    # 我们以 UAV 的高频时间轴为准，卫星位置在 1 秒内保持不变 (向前填充)
+    
+    # 获取所有唯一的时间点 (以 100ms 为单位)
+    all_timestamps = sorted(df_uav['time_ms'].unique())
+    print(f">>> Total Time Steps: {len(all_timestamps)} (from {min(all_timestamps)} to {max(all_timestamps)} ms)")
+    
+    # 建立索引以加速查询
+    # 我们不直接合并成一个巨大的 DataFrame (内存会爆)，而是按需提取
+    return df_sat, df_uav, all_timestamps
 
-def calculate_bandwidth(node_type_a, node_type_b):
-    types = {node_type_a, node_type_b}
+def get_nodes_at_timestamp(df_sat, df_uav, target_time_ms):
+    """
+    获取指定时刻的所有节点数据。
+    对于卫星：找到最近的一个 <= target_time_ms 的记录
+    对于 UAV：找到精确匹配的记录
+    """
+    # UAV: 精确匹配
+    uav_current = df_uav[df_uav['time_ms'] == target_time_ms]
+    
+    # SAT: 找到所属的整秒 (例如 1200ms -> 1000ms)
+    sat_time_key = (target_time_ms // 1000) * 1000
+    sat_current = df_sat[df_sat['time_ms'] == sat_time_key]
+    
+    # 合并
+    # 统一需要的列
+    cols = ['node_id', 'type', 'ecef_x', 'ecef_y', 'ecef_z', 'ip']
+    
+    # 容错：防止某些时刻数据缺失
+    if sat_current.empty and uav_current.empty:
+        return pd.DataFrame(columns=cols)
+        
+    nodes = pd.concat([
+        sat_current[cols], 
+        uav_current[cols]
+    ], ignore_index=True)
+    
+    return nodes
+
+# ---------------------------------------------------------
+# 模块 1 & 2: 物理层计算 (保持逻辑不变，适配数据)
+# ---------------------------------------------------------
+def calculate_delay(dist_m): return (dist_m / SPEED_OF_LIGHT) * 1000
+def calculate_jitter(delay_ms): return delay_ms * 0.1
+def calculate_bandwidth(type_a, type_b):
+    types = {type_a, type_b}
     if 'GS' in types and 'UAV' in types: return 54
-    elif 'UAV' in types and 'SAT' in types: return 20
-    elif 'SAT' in types and 'GS' in types: return 20
-    elif 'SAT' in types: return 100
+    if 'UAV' in types and 'SAT' in types: return 20
+    if 'SAT' in types and 'GS' in types: return 20
+    if 'SAT' in types: return 100
     return 10
-
-def calculate_bdp_queue(bw_mbps, delay_ms):                              
-    bdp_bits = (bw_mbps * 1e6) * (delay_ms * 2 * 1e-3)
-    queue_pkts = int(bdp_bits / 12000)
-    return max(10, queue_pkts)
+def calculate_bdp_queue(bw_mbps, delay_ms):
+    queue = int((bw_mbps * 1e6) * (delay_ms * 2 * 1e-3) / 12000)
+    return max(10, queue)
 
 def calculate_elevation(pos_a, pos_b):
-    dz = abs(pos_a[2] - pos_b[2])
-    dx = pos_a[0] - pos_b[0]
-    dy = pos_a[1] - pos_b[1]
-    horizontal_dist = math.sqrt(dx**2 + dy**2)
-    if horizontal_dist == 0: return 90.0
-    angle_rad = math.atan(dz / horizontal_dist)
-    return math.degrees(angle_rad)
+    # 简单的地心坐标系仰角近似计算
+    # 假设 pos_a 是地面观察者
+    # 向量 A (地心 -> 观察者), 向量 AB (观察者 -> 目标)
+    vec_a = np.array(pos_a)
+    vec_ab = np.array(pos_b) - np.array(pos_a)
+    
+    dist_a = np.linalg.norm(vec_a)
+    dist_ab = np.linalg.norm(vec_ab)
+    
+    if dist_a == 0 or dist_ab == 0: return 90.0
+    
+    # 计算余弦角：cos(theta) = (A . AB) / (|A|*|AB|)
+    # 仰角 = 90 - theta
+    cos_theta = np.dot(vec_a, vec_ab) / (dist_a * dist_ab)
+    # 限制范围防报错
+    cos_theta = max(min(cos_theta, 1.0), -1.0)
+    theta_rad = np.arccos(cos_theta)
+    
+    elevation = 90 - math.degrees(theta_rad)
+    return elevation
 
-# 2: 拓扑计算
-def compute_topology_at_time(df_t, time_ms):
+def compute_topology(nodes_df, time_ms):
     links = []
-    coords = df_t[['ecef_x', 'ecef_y', 'ecef_z']].values
-    ids = df_t['node_id'].values
-    types = df_t['type'].values
+    if len(nodes_df) < 2: return links
+    
+    coords = nodes_df[['ecef_x', 'ecef_y', 'ecef_z']].values
+    ids = nodes_df['node_id'].values
+    types = nodes_df['type'].values
+    
     tree = cKDTree(coords)
-    dists, indices = tree.query(coords, k=10, distance_upper_bound=MAX_LINK_RANGE)
+    # k=20: 真实数据密度可能较大，增加搜索范围
+    dists, indices = tree.query(coords, k=20, distance_upper_bound=MAX_LINK_RANGE)
+    
     processed_pairs = set()
 
     for i in range(len(ids)):
+        # 只让 GS 和 UAV 主动去连别人，卫星之间暂不建链(节省计算)，除非需要
+        # 或者为了全连接，保留双向遍历
         for j_idx, neighbor_idx in enumerate(indices[i]):
             if dists[i][j_idx] == float('inf') or i == neighbor_idx: continue
-            pair_key = tuple(sorted([ids[i], ids[neighbor_idx]]))
+            
+            # 按字母序排序 key，保证无向图去重
+            n1_id, n2_id = ids[i], ids[neighbor_idx]
+            pair_key = tuple(sorted([n1_id, n2_id]))
+            
             if pair_key in processed_pairs: continue
             
             type_a, type_b = types[i], types[neighbor_idx]
-            is_cross_layer = ('SAT' in [type_a, type_b]) and ('SAT' != type_a or 'SAT' != type_b)
-            if is_cross_layer:
-                low_idx = i if df_t.iloc[i]['ecef_z'] < df_t.iloc[neighbor_idx]['ecef_z'] else neighbor_idx
-                high_idx = neighbor_idx if low_idx == i else i
-                elev = calculate_elevation(coords[low_idx], coords[high_idx])
+            
+            # 策略：不建立 卫星-卫星 链路 (除非你需要做星间路由仿真)
+            # 为了减少输出量，我们只关心 GS/UAV 的连接
+            # if type_a == 'SAT' and type_b == 'SAT': continue 
+
+            # 仰角检查 (针对 SAT - GS/UAV)
+            is_sat_a = (type_a == 'SAT')
+            is_sat_b = (type_b == 'SAT')
+            
+            if is_sat_a != is_sat_b: # 这是一个跨层链路
+                sat_idx = i if is_sat_a else neighbor_idx
+                gnd_idx = neighbor_idx if is_sat_a else i
+                
+                elev = calculate_elevation(coords[gnd_idx], coords[sat_idx])
                 if elev < MIN_ELEVATION_DEG: continue
 
+            # 生成链路
             dist_m = dists[i][j_idx]
             delay = calculate_delay(dist_m)
-            jitter = calculate_jitter(delay)
             bw = calculate_bandwidth(type_a, type_b)
-            queue = calculate_bdp_queue(bw, delay)
             
             links.append({
                 'time_ms': time_ms,
-                'src': ids[i],
-                'dst': ids[neighbor_idx],
+                'src': n1_id,
+                'dst': n2_id,
                 'direction': 'BIDIR',
                 'distance_km': round(dist_m / 1000, 3),
                 'delay_ms': round(delay, 2),
-                'jitter_ms': round(jitter, 3),
+                'jitter_ms': round(calculate_jitter(delay), 3),
                 'loss_pct': 0.0,
                 'bw_mbps': bw,
-                'max_queue_pkt': queue,
+                'max_queue_pkt': calculate_bdp_queue(bw, delay),
                 'type': f"{type_a}-{type_b}",
                 'status': 'UP'
             })
             processed_pairs.add(pair_key)
     return links
 
-# 3: 路由策略生成 
-
-def build_network_graph(topology_links):
-    """
-    根据链路列表构建 NetworkX 图
-    图的边权重设置为 delay_ms，用于最短路计算
-    """
+# ---------------------------------------------------------
+# 模块 3: 路由策略 (适配真实 IP)
+# ---------------------------------------------------------
+def build_graph(links):
     G = nx.Graph()
-    for link in topology_links:
-        # 添加带权边
-        G.add_edge(link['src'], link['dst'], weight=link['delay_ms'])
+    for l in links:
+        G.add_edge(l['src'], l['dst'], weight=l['delay_ms'])
     return G
 
-def find_best_route(G, src_id, content_name, algo_mode):
-    """
-    寻找最佳路由路径
-    返回: (next_hop_id, next_hop_ip, target_id)
-    """
-    
-    # 1. 确定潜在的目标节点集合
+def find_route(G, src_id, content, mode, node_ip_map):
+    # 1. 确定候选者
     candidates = []
-    
-    if algo_mode == 'Content-Aware':
-        # 策略：只要节点有缓存，就是候选目标
-        for node, contents in CONTENT_LOCATIONS.items():
-            if content_name in contents and node in G.nodes:
+    if mode == 'Content-Aware':
+        for node, files in CONTENT_LOCATIONS.items():
+            if content in files and node in G.nodes:
                 candidates.append(node)
     
-    # 如果 Content-Aware 没找到候选者，或者模式是 Greedy，则回源
-    # 假设 SAT_02 是默认源站 
-    if not candidates or algo_mode == 'Greedy':
-        if 'SAT_02' in G.nodes:
-            candidates = ['SAT_02']
-        else:
-            return None, None, None # 源站不可达
+    # 默认回源：找任意一个可见的卫星
+    if not candidates or mode == 'Greedy':
+        # 在真实数据中，SAT ID 是动态的，不能写死 'SAT_02'
+        # 我们寻找图中所有 type='SAT' 的节点
+        # 这里需要从 ID 命名规则推断，你的 ID 是 SAT_xxxxx
+        sat_candidates = [n for n in G.nodes if str(n).startswith('SAT_')]
+        if sat_candidates:
+            # Greedy 策略：找延迟最小的那个卫星
+            candidates = sat_candidates
+    
+    if not candidates: return None, None, None
 
-    # 2. 在图中搜索到所有候选者的最短路径
+    # 2. 找最短路
+    best_target = None
     best_path = None
     min_cost = float('inf')
-    final_target = None
-    
+
     for target in candidates:
         try:
-            # Dijkstra 算法找最短延迟路径
-            path = nx.shortest_path(G, source=src_id, target=target, weight='weight')
-            # 计算路径总开销 (总延迟)
-            cost = nx.shortest_path_length(G, source=src_id, target=target, weight='weight')
-            
-            # 如果延迟差不多，Content-Aware 会优先选 UAV (边缘)，Greedy 只能选 SAT (源站)
-            
+            cost = nx.shortest_path_length(G, src_id, target, weight='weight')
             if cost < min_cost:
                 min_cost = cost
-                best_path = path
-                final_target = target
-        except nx.NetworkXNoPath:
-            continue
-
-   # 3. 提取下一跳
+                best_path = nx.shortest_path(G, src_id, target, weight='weight')
+                best_target = target
+        except: continue
+        
+    # 3. 提取结果
     if best_path and len(best_path) > 1:
-        next_hop_id = best_path[1] # path[0]是源，path[1]是下一跳
+        nh_id = best_path[1]
+        # 从全局 IP 表查 IP
+        nh_ip = node_ip_map.get(nh_id, "0.0.0.0")
+        return nh_id, nh_ip, best_target
         
-        # 直接调用生成函数获取 IP
-        next_hop_ip = get_ip_by_id(next_hop_id)
-        
-        # 简单校验一下生成的 IP 是否有效 (可选)
-        if next_hop_ip and next_hop_ip != "127.0.0.1": 
-            return next_hop_id, next_hop_ip, final_target
-        else:
-            # 如果 IP 生成逻辑失败，打个警告
-            print(f"[Warn] Cannot generate valid IP for {next_hop_id}")
-            return None, None, None
-            
     return None, None, None
 
-def generate_routing_rules(current_links, time_ms):
-    """生成某一时刻的路由规则"""
-    rules = []
-    
-    # --- 1. 构建当前时刻的网络图 ---
-    G = build_network_graph(current_links)
-    
-    # --- 2. 定义业务需求 ---
-    # 需求：GS_01 想要 map.tif
-    # 目标 IP (dst_cidr)：我们假设内容请求是发往一个虚拟 IP 或源站 IP (SAT_02 的 IP)
-    # S4 会拦截这个 IP 的流量，根据我们的规则转发
-    target_content_ip = "10.0.3.26/32" 
-    
-    # --- 3. 计算 Greedy 路径 (基准) ---
-    # Greedy 只会去找源站 SAT_02
-    nh_greedy, nh_ip_greedy, target_greedy = find_best_route(G, 'GS_01', 'map.tif', 'Greedy')
-    
-    if nh_greedy:
-        rules.append({
-            "time_ms": int(time_ms),
-            "node": "GS_01",
-            "dst_cidr": target_content_ip, 
-            "action": "replace",
-            "next_hop": nh_greedy,
-            "next_hop_ip": nh_ip_greedy,
-            "algo": "Greedy",
-            "debug_info": f"Target: {target_greedy}"
-        })
-
-    # --- 4. 计算 Content-Aware 路径 ---
-    # Content-Aware 可能会找到近处的 UAV_01
-    nh_smart, nh_ip_smart, target_smart = find_best_route(G, 'GS_01', 'map.tif', 'Content-Aware')
-    
-    if nh_smart:
-        rules.append({
-            "time_ms": int(time_ms),
-            "node": "GS_01",
-            "dst_cidr": target_content_ip, 
-            "action": "replace",
-            "next_hop": nh_smart,
-            "next_hop_ip": nh_ip_smart,
-            "algo": "Content-Aware-CGR",
-            "debug_info": f"Target: {target_smart}" 
-        })
-
-    return rules
-
-# 主流程 (保持不变)
 def main():
-    print(">>> S3 Brain Starting...")
-    
-    # 1. 读取轨迹
-    df = pd.read_csv('mock_trace.csv')
-    timestamps = df['time_ms'].unique()
-    timestamps.sort()
-    
-    all_links = []
-    all_rules = {"meta": {"version": "v1"}, "rules": []}
-    
-    # 2. 时间步循环
-    for t in timestamps:
-        t_val = int(t)
-        df_t = df[df['time_ms'] == t]
-        
-        # A. 计算拓扑
-        current_links = compute_topology_at_time(df_t, t_val)
-        all_links.extend(current_links)
-        
-        # B. 计算路由
-        current_rules = generate_routing_rules(current_links, t_val)
-        all_rules["rules"].extend(current_rules)
-        
-        print(f"Time {t_val}ms: Generated {len(current_links)} links, {len(current_rules)} rules.")
+    # 0. 准备输出目录
+    output_link_dir = 'output/links'
+    output_rule_dir = 'output/rules'
+    os.makedirs(output_link_dir, exist_ok=True)
+    os.makedirs(output_rule_dir, exist_ok=True)
 
-    # 3. 输出文件
-    df_links = pd.DataFrame(all_links)
-    cols = ['time_ms', 'src', 'dst', 'direction', 'distance_km', 'delay_ms', 
-            'jitter_ms', 'loss_pct', 'bw_mbps', 'max_queue_pkt', 'type', 'status']
-    df_links[cols].to_csv('topology_links.csv', index=False)
-    print(">>> Saved topology_links.csv")
+    # 1. 加载数据
+    df_sat, df_uav, timelines = load_and_merge_traces()
     
-    with open('routing_rules.json', 'w') as f:
-        json.dump(all_rules, f, indent=2, cls=NumpyEncoder)
-    print(">>> Saved routing_rules.json")
+    # 2. 构建全局 IP 映射表
+    print(">>> Building IP Map...")
+    node_ip_map = {}
+    for _, row in df_sat[['node_id', 'ip']].drop_duplicates().iterrows():
+        node_ip_map[row['node_id']] = row['ip']
+    for _, row in df_uav[['node_id', 'ip']].drop_duplicates().iterrows():
+        node_ip_map[row['node_id']] = row['ip']
+    print(f"   Mapped {len(node_ip_map)} nodes.")
+
+    # 3. 分片配置
+    CHUNK_SIZE_MS = 60000 # 60秒一个文件
+    
+    # 临时缓存当前分片的数据
+    chunk_links = []
+    chunk_rules = []
+    current_chunk_idx = 0
+    
+    print(f">>> Start Processing {len(timelines)} time steps...")
+
+    # 4. 主循环 (跑全量数据，去掉切片)
+    for i, t in enumerate(timelines): 
+        t_val = int(t)
+        
+        # --- A. 计算当前时刻数据 ---
+        current_nodes = get_nodes_at_timestamp(df_sat, df_uav, t_val)
+        
+        # 计算拓扑
+        links = compute_topology(current_nodes, t_val)
+        chunk_links.extend(links)
+        
+        # 计算路由 (GS_01 -> map.tif)
+        if 'GS_01' in current_nodes['node_id'].values:
+            G = build_graph(links)
+            nh, nh_ip, target = find_route(G, 'GS_01', 'map.tif', 'Content-Aware', node_ip_map)
+            if nh:
+                chunk_rules.append({
+                    "time_ms": t_val,
+                    "node": "GS_01",
+                    "dst_cidr": "10.0.0.254/32",
+                    "action": "replace",
+                    "next_hop": nh,
+                    "next_hop_ip": nh_ip,
+                    "algo": "Content-Aware-CGR",
+                    "debug_info": f"Target: {target}"
+                })
+        
+        # 进度日志
+        if i % 100 == 0:
+            print(f"   [Progress] Step {i}/{len(timelines)} (Time {t_val}ms)")
+
+        # --- B. 检查是否需要保存分片 ---
+        # 如果当前是该分片的最后一帧，或者总数据的最后一帧
+        is_last_step = (i == len(timelines) - 1)
+        # 判断是否跨越了 60秒 的边界
+        # 逻辑：如果下一个时间点属于下一个 60秒 区间，则保存当前
+        next_t = timelines[i+1] if not is_last_step else -1
+        
+        if is_last_step or (int(next_t / CHUNK_SIZE_MS) > int(t_val / CHUNK_SIZE_MS)):
+            # 生成文件名
+            # 例如: topology_links_0_59900.csv
+            start_ms = current_chunk_idx * CHUNK_SIZE_MS
+            # 实际上结束时间是当前帧的时间
+            end_ms = t_val 
+            
+            link_filename = f"topology_links_{start_ms}_{end_ms}.csv"
+            rule_filename = f"routing_rules_{start_ms}_{end_ms}.json"
+            
+            # 保存链路
+            if chunk_links:
+                df_links = pd.DataFrame(chunk_links)
+                cols = ['time_ms', 'src', 'dst', 'direction', 'distance_km', 'delay_ms', 
+                        'jitter_ms', 'loss_pct', 'bw_mbps', 'max_queue_pkt', 'type', 'status']
+                # 确保列存在，防止空数据报错
+                for c in cols:
+                    if c not in df_links.columns: df_links[c] = None
+                df_links[cols].to_csv(os.path.join(output_link_dir, link_filename), index=False)
+            
+            # 保存规则
+            rule_data = {"meta": {"version": "v1", "chunk_id": current_chunk_idx}, "rules": chunk_rules}
+            with open(os.path.join(output_rule_dir, rule_filename), 'w') as f:
+                json.dump(rule_data, f, indent=2, cls=NumpyEncoder)
+            
+            print(f"   >>> [Saved Chunk {current_chunk_idx}] {link_filename}")
+            
+            # 重置缓存
+            chunk_links = []
+            chunk_rules = []
+            current_chunk_idx += 1
+
+    print(">>> All Done.")
 
 if __name__ == "__main__":
     main()
