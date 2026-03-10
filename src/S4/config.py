@@ -15,7 +15,7 @@ import logging
 import os
 class LogColor:
     """
-    根据不同的日志级别，打印不同颜色的日志，并将日志写入文件
+    根据不同的日志级别，打印不同颜色的日志，并将日志写入不同的文件
     info：绿色
     warning：黄色
     error：红色
@@ -24,34 +24,51 @@ class LogColor:
     # 确保日志文件夹存在
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, "runtime.log")
 
-    # logging日志格式设置
-    logging.basicConfig(level=logging.DEBUG,
-                        format='%(asctime)s - %(levelname)s: %(message)s',
-                        filename=log_file,  # 日志输出到文件
-                        filemode='a')  # 追加模式
+    # 定义不同日志级别的文件
+    info_log_file = os.path.join(log_dir, "info_runtime.log")
+    warning_log_file = os.path.join(log_dir, "warning_runtime.log")
+    error_log_file = os.path.join(log_dir, "error_runtime.log")
+    debug_log_file = os.path.join(log_dir, "debug_runtime.log")
+
+    # 配置不同的日志记录器
+    info_logger = logging.getLogger("info_logger")
+    warning_logger = logging.getLogger("warning_logger")
+    error_logger = logging.getLogger("error_logger")
+    debug_logger = logging.getLogger("debug_logger")
+
+    for logger, log_file in [
+        (info_logger, info_log_file),
+        (warning_logger, warning_log_file),
+        (error_logger, error_log_file),
+        (debug_logger, debug_log_file)
+    ]:
+        handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s: %(message)s'))
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
 
     @staticmethod
     def info(message: str):
         # info级别的日志，绿色
-        logging.info(message)
+        LogColor.info_logger.info(message)
         print("\033[0;32m" + message + "\033[0m")
 
     @staticmethod
     def warning(message: str):
         # warning级别的日志，黄色
-        logging.warning(message)
+        LogColor.warning_logger.warning(message)
         print("\033[0;33m" + message + "\033[0m")
 
     @staticmethod
     def error(message: str):
         # error级别的日志，红色
-        logging.error("-" * 120 + '\n| ' + message + "\n" + "└" + "-" * 150)
-        print("\033[0;31m" + "-" * 120 + '\n| ' + message + "\033[0m" + "\n" + "└" + "-" * 150)
+        formatted_message = "-" * 120 + '\n| ' + message + "\n" + "└" + "-" * 150
+        LogColor.error_logger.error(formatted_message)
+        print("\033[0;31m" + formatted_message + "\033[0m")
 
     @staticmethod
     def debug(message: str):
         # debug级别的日志，灰色
-        logging.debug(message)
+        LogColor.debug_logger.debug(message)
         print("\033[0;37m" + message + "\033[0m")

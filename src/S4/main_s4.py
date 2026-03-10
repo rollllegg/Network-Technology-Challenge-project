@@ -86,7 +86,7 @@ def run():
     engine = Engine()
     timer = 0
     for csv_file, rules_file in zip(GetAllFiles(csv_dir), GetAllFiles(rules_dir)):
-        LogColor.info(f"csv file: {csv_file}\n, rules file: {rules_file}\n")
+        LogColor.info(f"csv file: {csv_file}\nrules file: {rules_file}\n")
         links = ReadLinks(csv_file)
         meta, rules = ReadRules(rules_file)
         engine.AddContent('UAV_01', 'test.jpg', filesize=50)
