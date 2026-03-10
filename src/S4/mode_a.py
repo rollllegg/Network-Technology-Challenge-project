@@ -37,8 +37,8 @@ class Engine:
         # 先在mininet中加入链路
         n1 : str = link['src']
         n2 : str = link['dst']
-        LogColor.debug(f'src: {n1}')
-        LogColor.debug(f'dst: {n2}')
+        # LogColor.debug(f'src: {n1}')
+        # LogColor.debug(f'dst: {n2}')
         # 处理节点可能不存在的问题
         for n in (n1, n2):
             if n.startswith('GS'):
@@ -56,6 +56,7 @@ class Engine:
                 
         # 处理链路可能不存在的问题
         links = self.net.linksBetween(n1, n2)
+        LogColor.info(f'links between {n1} and {n2} : {links}')
         if not links:
             lk = self.net.addLink(
                 n1, n2,
