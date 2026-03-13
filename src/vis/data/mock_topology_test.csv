@@ -1,6 +1,0 @@
-time_ms,source,target,status
-0,GS_01,UAV_01,up
-0,UAV_01,SAT_01,up
-5000,UAV_01,SAT_01,down
-8000,UAV_01,SAT_01,up
-15000,GS_01,UAV_01,down
